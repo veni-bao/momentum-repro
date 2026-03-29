@@ -2,13 +2,15 @@
 import pandas as pd
 import numpy as np
 from scipy import stats
+from pathlib import Path
+import sys
 
 np.random.seed(42)
 print("=" * 50)
 print("Mock Data Generator")
 print("=" * 50)
 
-# 1. 创建模拟数据
+# 1. Create mock data
 dates = [f'2019{str(m).zfill(2)}{str(d).zfill(2)}' for m in range(1,13) for d in range(1,29)][:50]
 stocks = [f'{i:06d}' for i in range(1,51)]
 
@@ -23,13 +25,13 @@ for code in stocks:
 df = pd.DataFrame(data).sort_values(['ts_code','trade_date'])
 df['ret'] = df['close'] / df['prev_close'] - 1
 
-# 2. 计算OLD_Momentum
+# 2. Calculate OLD_Momentum
 lb = 20
 df['OLD_Momentum'] = df.groupby('ts_code')['ret'].transform(
     lambda g: g.rolling(lb).apply(lambda x: np.prod(1+x)-1, raw=False)
 )
 
-# 3. 构造NEW因子
+# 3. NEW factors
 df['NEW_Intra'] = np.random.randn(len(df)) * 0.1 + df['OLD_Momentum'] * 0.5
 df['NEW_Over'] = np.random.randn(len(df)) * 0.1 - df['OLD_Momentum'] * 0.3
 df['NEW_Momentum'] = df['NEW_Intra'] + df['NEW_Over']
@@ -50,25 +52,24 @@ for fc in ['OLD_Momentum', 'NEW_Intra', 'NEW_Over', 'NEW_Momentum']:
     
     ic, _ = stats.spearmanr(v[fc], v['fwd'])
     
-    v['rank'] = v[fc].rank(pct=True)
-    v['g'] = pd.cut(v['rank'], bins=[0,0.2,0.4,0.6,0.8,1], labels=[1,2,3,4,5])
-    g1 = v[v['g']==1]['fwd'].mean()
-    g5 = v[v['g']==5]['fwd'].mean()
-    ls = g1 - g5
-    ann = ls * 12 * 100
-    vol = v['fwd'].std() * 312
-    ir = ann / vol if vol > 0 else 0
+    try:
+        v['rank'] = v[fc].rank(pct=True)
+        v['g'] = pd.cut(v['rank'], bins=[0,0.2,0.4,0.6,0.8,1], labels=[1,2,3,4,5])
+        g1 = v[v['g']==1]['fwd'].mean()
+        g5 = v[v['g']==5]['fwd'].mean()
+        ls = g1 - g5
+        ann = ls * 12 * 100
+        vol = v['fwd'].std() * 312
+        ir = ann / vol if vol > 0 else 0
+    except:
+        ann, ir = 0, 0
     
     print(f"{fc:<15} IC:{ic:+.3f}  Ann:{ann:+.1f}%  IR:{ir:+.2f}")
 
 print("-"*50)
 print("SUCCESS!")
 
-# 保存
-import sys
-sys.path.insert(0, str(Path(__file__).parent.parent.parent))
-from pathlib import Path
-
+# Save
 output = Path(__file__).parent.parent / 'output'
 output.mkdir(exist_ok=True)
 
