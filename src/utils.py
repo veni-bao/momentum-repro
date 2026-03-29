@@ -44,8 +44,9 @@ def neutralize(factor: np.ndarray, style: np.ndarray) -> np.ndarray:
     style = style.reshape(-1, 1) if style.ndim == 1 else style
     
     # 最小二乘
-    coef = np.linalg.lstsq(np.c_[np.ones(len(style)), style, rcond=None)[0]
-    residual = factor - np.dot(np.c_[np.ones(len(style)), coef)
+    X = np.c_[np.ones(len(style)), style]
+    coef = np.linalg.lstsq(X, factor, rcond=None)[0]
+    residual = factor - X @ coef
     return residual
 
 

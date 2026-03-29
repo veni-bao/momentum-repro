@@ -17,35 +17,51 @@
 ```
 momentum_repro/
 ├── data/                     # 数据目录
-│   └── mock/                 # 模拟数据生成
-│       └── test_run.py
-├── output/                   # 结果输出
-├── src/                      # 源代码
-│   ├── utils.py             # 工具函数 (含Numba加速)
-│   ├── data/                # 数据模块
-│   │   └── 01_data_prep.py # 数据接口
-│   └── factors/             # 因子模块
-│       └── 02_factor_build.py # 因子构建
-├── config/                   # 配置
-├── pyproject.toml            # uv环境配置
+│   ├── mock/                # 模拟数据（自动生成）
+│   └── input/              # 真实数据输入目录
+├── output/                  # 结果输出
+│   ├── backtest_results.txt
+│   ├── factor_comparison.png
+│   ├── ic_comparison.png
+│   └── group_net_value.png
+├── src/                     # 源代码
+│   ├── utils.py           # 工具函数
+│   ├── data/              # 数据模块
+│   │   └── 01_data_prep.py
+│   ├── factors/           # 因子模块
+│   │   └── 02_factor_build.py
+│   ├── backtest/          # 回测模块
+│   │   ├── 03_backtest.py
+│   │   ├── 04_robustness.py
+│   │   └── 05_visualize.py
+│   └── main.py            # 主程序
+├── pyproject.toml          # uv环境配置
 └── README.md
 ```
 
-## 环境配置
+## 快速开始
 
 ```bash
-# 使用uv安装依赖
+# 安装依赖
 uv sync
 
-# 运行测试
-python -m data.mock.test_run
+# 运行分析
+python -m src.main
 ```
 
-或使用提供的脚本:
-
+或使用PowerShell脚本:
 ```powershell
-.\run_tests.ps1 -All
+.\run_tests.ps1
 ```
+
+## 输出结果
+
+运行后会在 `output/` 目录生成:
+
+- `backtest_results.txt` - 文本结果
+- `factor_comparison.png` - 因子对比表格
+- `ic_comparison.png` - IC对比柱状图
+- `group_net_value.png` - 5分组净值走势图
 
 ## 核心公式
 
@@ -58,11 +74,6 @@ python -m data.mock.test_run
 
 $$OLD\_Momentum = \prod_{t=1}^{N}(1+r_t+g_t) - 1$$
 
-### 局部因子
-
-- 局部日内因子：按当日换手率排序分组
-- 局部隔夜因子：按昨日换手率排序分组
-
 ### 新因子合成
 
 $$NEW\_Intraday = -zscore(Part_1) + zscore(Part_5)$$
@@ -73,42 +84,22 @@ $$NEW\_Momentum = zscore(NEW\_Intraday) + zscore(NEW\_Overnight)$$
 
 ## 数据要求
 
-| 字段 | 类型 | 必填 | 说明 |
-|-----|------|-----|------|
-| ts_code | str | ✅ | 股票代码 |
-| trade_date | str | ✅ | 交易日期 (YYYYMMDD) |
-| open | float | ✅ | 开盘价 |
-| close | float | ✅ | 收盘价 |
-| high | float | ✅ | 最高价 |
-| low | float | ✅ | 最低价 |
-| volume | float | ✅ | 成交量 |
-| turnover_rate | float | ❌ | 换手率 |
-| prev_close | float | ❌ | 昨日收盘价 |
-
-## 性能指标
-
-| 指标 | 说明 |
-|-----|------|
-| IC均值 | Spearman相关系数均值 |
-| 年化ICIR | IC均值/IC标准差×√12 |
-| 年化收益率 | 多空对冲年化收益 |
-| 信息比率(IR) | 年化收益/年化波动 |
-| 月度胜率 | 对冲收益>0的月份占比 |
-| 最大回撤 | 净值最大回撤 |
+| 字段 | 类型 | 必填 |
+|-----|------|-----|
+| ts_code | str | ✅ |
+| trade_date | str | ✅ |
+| open/close/high/low | float | ✅ |
+| volume | float | ✅ |
+| turnover_rate | float | ❌ |
 
 ## 依赖
 
-```toml
-dependencies = [
-    "pandas>=1.5.0",
-    "numpy>=1.23.0",
-    "scipy>=1.9.0",
-    "matplotlib>=3.6.0",
-    "seaborn>=0.12.0",
-    "numba>=0.56.0",
-    "pyyaml>=6.0",
-]
-```
+- pandas >= 1.5.0
+- numpy >= 1.23.0
+- scipy >= 1.9.0
+- matplotlib >= 3.6.0
+- numba >= 0.56.0
+- pyyaml >= 6.0
 
 ## 参考
 
