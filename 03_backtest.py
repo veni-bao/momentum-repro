@@ -10,151 +10,228 @@
 import pandas as pd
 import numpy as np
 from scipy import stats
-from pathlib import Path
-from collections import defaultdict
+from typing import Dict, List, Tuple
+import warnings
 
-# ============== 配置 ==============
-DATA_PATH = Path(__file__).parent / "data"
-OUTPUT_PATH = Path(__file__).parent / "output"
 
-# ============== IC分析 ==============
-def calc_ic(factor_df, price_df, factor_col, return_col='next_return'):
+# ========== 1. IC分析 ==========
+
+def calc_ic(
+    factors_df: pd.DataFrame,
+    returns_df: pd.DataFrame,
+    factor_col: str,
+    date_col: str = 'trade_date',
+    code_col: str = 'ts_code'
+) -> pd.Series:
     """
     计算月度IC (Spearman相关系数)
+    
     IC = SpearmanCorr(因子值_t, 下期收益_t+1)
+    
+    Args:
+        factors_df: 因子DataFrame
+        returns_df: 收益DataFrame
+        factor_col: 因子列名
+        date_col: 日期列名
+        code_col: 股票代码列名
+    
+    Returns:
+        月度IC序列
     """
     # 合并因子和收益
-    merged = factor_df.merge(price_df, on=['ts_code', 'trade_date'])
+    merged = factors_df.merge(
+        returns_df,
+        on=[code_col, date_col]
+    )
+    
+    if merged.empty:
+        warnings.warn("合并后数据为空")
+        return pd.Series()
     
     # 按月计算IC
     ic_series = []
-    for month, group in merged.groupby('trade_date'):
+    
+    for date, group in merged.groupby(date_col):
         if len(group) < 10:
             continue
-            
-        # 过滤NaN
-        valid = group[[factor_col, return_col]].dropna()
+        
+        valid = group[[factor_col, 'forward_return']].dropna()
         if len(valid) < 10:
             continue
-            
-        # Spearman相关
-        ic, _ = stats.spearmanr(valid[factor_col], valid[return_col])
-        if not np.isnan(ic):
-            ic_series.append({'trade_date': month, 'IC': ic})
+        
+        try:
+            ic, _ = stats.spearmanr(valid[factor_col], valid['forward_return'])
+            if not np.isnan(ic):
+                ic_series.append({'date': date, 'IC': ic})
+        except:
+            continue
     
-    return pd.DataFrame(ic_series)
+    return pd.DataFrame(ic_series).set_index('date')['IC']
 
 
-def calc_ic_metrics(ic_df):
+def calc_ic_metrics(
+    ic_series: pd.Series,
+    annualize: bool = True
+) -> Dict[str, float]:
     """
     计算IC相关指标
-    - IC均值
-    - IC标准差
-    - 年化ICIR = mean(IC) / std(IC) * sqrt(12)
-    - IC的T统计量
+    
+    Args:
+        ic_series: 月度IC序列
+        annualize: 是否年化
+    
+    Returns:
+        指标字典
     """
-    ic_mean = ic_df['IC'].mean()
-    ic_std = ic_df['IC'].std()
-    ic_ir = ic_mean / ic_std * np.sqrt(12) if ic_std > 0 else 0
+    if ic_series.empty:
+        return {
+            'IC均值': np.nan,
+            'IC标准差': np.nan,
+            'ICIR': np.nan,
+            'IC_T统计量': np.nan,
+            '月度胜率': np.nan
+        }
+    
+    ic_mean = ic_series.mean()
+    ic_std = ic_series.std()
+    n = len(ic_series)
+    
+    # ICIR
+    if annualize:
+        ic_ir = ic_mean / ic_std * np.sqrt(12) if ic_std > 0 else np.nan
+    else:
+        ic_ir = ic_mean / ic_std if ic_std > 0 else np.nan
     
     # T统计量
-    n = len(ic_df)
-    ic_t = ic_mean / (ic_std / np.sqrt(n)) if ic_std > 0 else 0
+    ic_t = ic_mean / (ic_std / np.sqrt(n)) if ic_std > 0 else np.nan
+    
+    # 月度胜率
+    win_rate = (ic_series > 0).mean()
     
     return {
         'IC均值': ic_mean,
         'IC标准差': ic_std,
-        '年化ICIR': ic_ir,
+        'ICIR': ic_ir,
         'IC_T统计量': ic_t,
-        '月度胜率': (ic_df['IC'] > 0).mean()
+        '月度胜率': win_rate
     }
 
 
-# ============== 5分组回测 ==============
-def calc_group_returns(factor_df, price_df, factor_col, n_groups=5):
+# ========== 2. 分组回测 ==========
+
+def group_returns(
+    factors_df: pd.DataFrame,
+    returns_df: pd.DataFrame,
+    factor_col: str,
+    n_groups: int = 5,
+    date_col: str = 'trade_date',
+    code_col: str = 'ts_code'
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
-    5分组回测
-    每月末按因子值分组，次月持有
-    """
-    results = []
+    分组回测
     
-    for month, group in factor_df.groupby('trade_date'):
-        # 获取下月收益
-        next_month = str(int(month) + 1)
-        if next_month not in price_df['yearmonth'].values:
-            continue
-            
-        # 合并
-        merged = group.merge(
-            price_df[price_df['yearmonth'] == next_month],
-            on='ts_code',
-            suffixes=('_factor', '_return')
+    Args:
+        factors_df: 因子DataFrame
+        returns_df: 收益DataFrame
+        factor_col: 因子列名
+        n_groups: 分组数
+        date_col: 日期列名
+        code_col: 股票代码列名
+    
+    Returns:
+        (分组收益, 多空对冲收益)
+    """
+    # 合并
+    merged = factors_df.merge(
+        returns_df,
+        on=[code_col, date_col]
+    )
+    
+    if merged.empty:
+        warnings.warn("合并后数据为空")
+        return pd.DataFrame(), pd.DataFrame()
+    
+    # 分组
+    try:
+        merged['group'] = pd.qcut(
+            merged[factor_col], 
+            n_groups, 
+            labels=range(1, n_groups+1),
+            duplicates='drop'
         )
-        
-        if len(merged) < 10:
-            continue
-        
-        # 分组
-        try:
-            merged['group'] = pd.qcut(merged[factor_col], n_groups, labels=range(1, n_groups+1), duplicates='drop')
-        except:
-            continue
-        
-        # 计算各组收益
-        for g in range(1, n_groups+1):
-            gdata = merged[merged['group'] == g]
-            if len(gdata) > 0:
-                results.append({
-                    'trade_date': next_month,
-                    'group': g,
-                    'return': gdata['next_return'].mean()
-                })
+    except:
+        return pd.DataFrame(), pd.DataFrame()
     
-    return pd.DataFrame(results)
-
-
-def calc_ls_return(group_returns):
-    """
-    计算多空对冲收益
-    Long: 分组1 (低因子值)
-    Short: 分组5 (高因子值)
-    """
-    # 按月计算多空收益
-    ls = []
-    for month, group in group_returns.groupby('trade_date'):
-        g1 = group[group['group'] == 1]['return'].mean()
-        g5 = group[group['group'] == 5]['return'].mean()
-        if not (np.isnan(g1) or np.isnan(g5)):
-            ls.append({
-                'trade_date': month,
-                'ls_return': g1 - g5
+    # 计算各组收益
+    group_returns = []
+    ls_returns = []
+    
+    for date, month_data in merged.groupby(date_col):
+        group_ret = month_data.groupby('group')['forward_return'].mean()
+        
+        for g, ret in group_ret.items():
+            group_returns.append({
+                'date': date,
+                'group': g,
+                'return': ret
+            })
+        
+        # 多空对冲: 做多低因子，做空高因子
+        if 1 in group_ret.index and n_groups in group_ret.index:
+            ls = group_ret[1] - group_ret[n_groups]
+            ls_returns.append({
+                'date': date,
+                'return': ls
             })
     
-    return pd.DataFrame(ls)
+    return pd.DataFrame(group_returns), pd.DataFrame(ls_returns)
 
 
-def calc_performance_metrics(returns_df):
+def calc_performance_metrics(
+    returns_df: pd.DataFrame,
+    annualize: bool = True
+) -> Dict[str, float]:
     """
     计算绩效指标
-    - 年化收益率
-    - 年化波动率
-    - 信息比率 IR = mean / std * sqrt(12)
-    - 月度胜率
-    - 最大回撤
-    """
-    if len(returns_df) == 0:
-        return {}
     
-    rets = returns_df['ls_return'].dropna()
+    Args:
+        returns_df: 收益序列 (有 return 列)
+        annualize: 是否年化
+    
+    Returns:
+        绩效指标字典
+    """
+    if returns_df.empty:
+        return {
+            '年化收益率': np.nan,
+            '年化波动率': np.nan,
+            '信息比率': np.nan,
+            '月度胜率': np.nan,
+            '最大回撤': np.nan
+        }
+    
+    rets = returns_df['return'].dropna()
+    
+    if len(rets) == 0:
+        return {
+            '年化收益率': np.nan,
+            '年化波动率': np.nan,
+            '信息比率': np.nan,
+            '月度胜率': np.nan,
+            '最大回撤': np.nan
+        }
     
     # 年化收益
-    annual_return = rets.mean() * 12
+    annual_return = rets.mean() * 12 if annualize else rets.mean()
     
     # 年化波动
-    annual_vol = rets.std() * np.sqrt(12)
+    annual_vol = rets.std() * np.sqrt(12) if annualize else rets.std()
     
     # 信息比率
-    ir = annual_return / annual_vol if annual_vol > 0 else 0
+    if annual_vol > 0:
+        ir = annual_return / annual_vol
+    else:
+        ir = np.nan
     
     # 月度胜率
     win_rate = (rets > 0).mean()
@@ -166,82 +243,122 @@ def calc_performance_metrics(returns_df):
     max_dd = drawdown.min()
     
     return {
-        '年化收益率': f"{annual_return*100:.2f}%",
-        '年化波动率': f"{annual_vol*100:.2f}%",
-        '信息比率': f"{ir:.2f}",
-        '月度胜率': f"{win_rate*100:.2f}%",
-        '最大回撤': f"{max_dd*100:.2f}%"
+        '年化收益率': annual_return * 100,
+        '年化波动率': annual_vol * 100,
+        '信息比率': ir,
+        '月度胜率': win_rate * 100,
+        '最大回撤': max_dd * 100
     }
 
 
-# ============== 主函数 ==============
-def main():
-    print("=" * 50)
-    print("Step 3: 分组回测与IC分析")
-    print("=" * 50)
+# ========== 3. 主函数 ==========
+
+def run_backtest(
+    factors_df: pd.DataFrame,
+    price_df: pd.DataFrame,
+    lookback: int = 20,
+    factor_cols: List[str] = None
+) -> Dict[str, Dict]:
+    """
+    运行完整回测
     
-    # 加载因子数据
-    factor_file = OUTPUT_PATH / "factors.parquet"
-    if not factor_file.exists():
-        print(f"错误: 未找到因子文件 {factor_file}")
-        print("请先运行 02_factor_build.py")
-        return
+    Args:
+        factors_df: 因子DataFrame (需包含 factor_col, ts_code, trade_date)
+        price_df: 价格DataFrame (需包含 close, ts_code, trade_date)
+        lookback: 回看天数
+        factor_cols: 要测试的因子列表
     
-    factor_df = pd.read_parquet(factor_file)
-    print(f"加载因子数据: {len(factor_df):,} 行")
+    Returns:
+        因子名 -> 指标字典
+    """
+    if factor_cols is None:
+        factor_cols = [
+            'OLD_Momentum', 'OLD_Intraday', 'OLD_Overnight',
+            'NEW_Intraday', 'NEW_Overnight', 'NEW_Momentum'
+        ]
     
-    # 加载价格数据计算收益
-    price_file = DATA_PATH / "cleaned_data.parquet"
-    price_df = pd.read_parquet(price_file)
-    
-    # 计算下月收益
+    # 计算下期收益
+    price_df = price_df.copy()
     price_df = price_df.sort_values(['ts_code', 'trade_date'])
-    price_df['next_return'] = price_df.groupby('ts_code')['return'].shift(-1)
-    price_df['yearmonth'] = price_df['trade_date'].astype(str).str[:6]
+    price_df['forward_return'] = price_df.groupby('ts_code')['close'].pct_change().shift(-1)
     
-    # 因子列表
-    factors = [
-        'OLD_Momentum', 'OLD_Intraday', 'OLD_Overnight',
-        'NEW_Intraday', 'NEW_Overnight', 'NEW_Momentum',
-        'Intraday_part1', 'Intraday_part5',
-        'Overnight_part1', 'Overnight_part5'
-    ]
+    print("=" * 50)
+    print("回测分析")
+    print("=" * 50)
     
     results = {}
     
-    for factor in factors:
-        if factor not in factor_df.columns:
+    for factor in factor_cols:
+        if factor not in factors_df.columns:
             print(f"跳过 {factor} (不存在)")
             continue
-            
-        print(f"\n>>> 分析因子: {factor}")
         
-        # IC分析
-        ic_df = calc_ic(factor_df, price_df, factor)
-        ic_metrics = calc_ic_metrics(ic_df)
+        print(f"\n>>> 因子: {factor}")
+        
+        # IC��析
+        ic_series = calc_ic(factors_df, price_df, factor)
+        ic_metrics = calc_ic_metrics(ic_series)
         
         # 分组回测
-        group_ret = calc_group_returns(factor_df, price_df, factor)
-        ls_ret = calc_ls_return(group_ret)
+        group_ret, ls_ret = group_returns(factors_df, price_df, factor)
+        
+        if ls_ret.empty:
+            print(f"  回测数据为空")
+            continue
+        
         perf = calc_performance_metrics(ls_ret)
         
+        # 合并结果
         results[factor] = {**ic_metrics, **perf}
         
-        # 打印结果
+        # 打印
         print(f"  IC均值: {ic_metrics['IC均值']:.4f}")
-        print(f"  年化ICIR: {ic_metrics['年化ICIR']:.2f}")
-        if perf:
-            print(f"  年化收益: {perf.get('年化收益率', 'N/A')}")
-            print(f"  信息比率: {perf.get('信息比率', 'N/A')}")
+        print(f"  ICIR: {ic_metrics['ICIR']:.2f}")
+        print(f"  年化收益: {perf['年化收益率']:.2f}%")
+        print(f"  信息比率: {perf['信息比率']:.2f}")
+        print(f"  月度胜率: {perf['月度胜率']:.2f}%")
+        print(f"  最大回撤: {perf['最大回撤']:.2f}%")
     
-    # 保存结果
-    results_df = pd.DataFrame(results).T
-    output_file = OUTPUT_PATH / "backtest_results.csv"
-    results_df.to_csv(output_file)
-    print(f"\n保存结果到: {output_file}")
+    return results
+
+
+def main():
+    """测试"""
+    # 简单测试
+    np.random.seed(42)
     
-    return results_df
+    dates = pd.date_range('2019-01-01', periods=30).strftime('%Y%m%d')
+    stocks = ['000001', '000002', '000003']
+    
+    # 因子数据
+    factors = []
+    for s in stocks:
+        for d in dates:
+            factors.append({
+                'ts_code': s,
+                'trade_date': d,
+                'OLD_Momentum': np.random.randn() * 0.1,
+                'NEW_Momentum': np.random.randn() * 0.1
+            })
+    
+    # 价格数据
+    prices = []
+    for s in stocks:
+        for d in dates:
+            prices.append({
+                'ts_code': s,
+                'trade_date': d,
+                'close': 10 + np.random.randn() * 0.5
+            })
+    
+    factors_df = pd.DataFrame(factors)
+    prices_df = pd.DataFrame(prices)
+    
+    results = run_backtest(factors_df, prices_df)
+    print("\n结果:")
+    print(results)
 
 
 if __name__ == "__main__":
+    import numpy as np
     main()
