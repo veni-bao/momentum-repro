@@ -1,9 +1,8 @@
-# Mock data generator
+# Mock data generator - with enhanced output
 import pandas as pd
 import numpy as np
 from scipy import stats
 from pathlib import Path
-import sys
 
 np.random.seed(42)
 print("=" * 50)
@@ -42,9 +41,14 @@ pr['fwd'] = pr.groupby('ts_code')['close'].pct_change().shift(-1)
 
 m = df.merge(pr, on=['ts_code','trade_date'])
 
-# 5. Backtest
-print("\nResults:")
-print("-"*50)
+# 5. Enhanced Backtest with more decimal places
+print("\n" + "=" * 55)
+print("                    Backtest Results")
+print("=" * 55)
+print(f"{'Factor':<18} {'IC':>10} {'Ann.%':>10} {'IR':>10} {'Win%':>10}")
+print("-" * 55)
+
+results = {}
 
 for fc in ['OLD_Momentum', 'NEW_Intra', 'NEW_Over', 'NEW_Momentum']:
     v = m[[fc,'fwd']].dropna()
@@ -59,21 +63,62 @@ for fc in ['OLD_Momentum', 'NEW_Intra', 'NEW_Over', 'NEW_Momentum']:
         g5 = v[v['g']==5]['fwd'].mean()
         ls = g1 - g5
         ann = ls * 12 * 100
-        vol = v['fwd'].std() * 312
+        vol = v['fwd'].std() * np.sqrt(12) * 100
         ir = ann / vol if vol > 0 else 0
+        win = (v['fwd'] > 0).mean() * 100
     except:
-        ann, ir = 0, 0
+        ann, ir, win = 0, 0, 0
     
-    print(f"{fc:<15} IC:{ic:+.3f}  Ann:{ann:+.1f}%  IR:{ir:+.2f}")
+    # Enhanced formatting: IC to 4 decimals, others to 3
+    print(f"{fc:<18} {ic:>+10.4f} {ann:>+10.3f} {ir:>+10.3f} {win:>+10.1f}")
+    
+    results[fc] = {
+        'IC': ic,
+        'Ann': ann,
+        'IR': ir,
+        'WinRate': win
+    }
 
-print("-"*50)
+print("-" * 55)
 print("SUCCESS!")
 
-# Save
+# 6. Save results to text file
 output = Path(__file__).parent.parent / 'output'
 output.mkdir(exist_ok=True)
 
+# Write detailed results
+with open(output / 'backtest_results.txt', 'w', encoding='utf-8') as f:
+    f.write("=" * 55 + "\n")
+    f.write("           Backtest Results\n")
+    f.write("=" * 55 + "\n\n")
+    f.write(f"{'Factor':<18} {'IC':>10} {'Ann.%':>10} {'IR':>10} {'Win%':>10}\n")
+    f.write("-" * 55 + "\n")
+    
+    for fc, res in results.items():
+        f.write(f"{fc:<18} {res['IC']:>+10.4f} {res['Ann']:>+10.3f} {res['IR']:>+10.3f} {res['WinRate']:>+10.1f}\n")
+    
+    f.write("-" * 55 + "\n\n")
+    
+    # Mock Barra correlation (random for testing)
+    f.write("\n" + "=" * 55 + "\n")
+    f.write("     NEW_Momentum vs Barra Style Factors\n")
+    f.write("=" * 55 + "\n")
+    
+    barra_factors = ['Beta', 'Momentum', 'BooktoPrice', 'EarningsYield', 
+                    'Growth', 'Leverage', 'ResidualVolatility', 'Liquidity', 
+                    'Size', 'NonLinearSize']
+    
+    np.random.seed(42)
+    for bf in barra_factors:
+        corr = np.random.uniform(-0.1, 0.3)
+        f.write(f"{bf:<20} {corr:>+10.4f}\n")
+    
+    f.write("\n" + "=" * 55 + "\n")
+    f.write("Note: Barra correlations are simulated for testing\n")
+    f.write("=" * 55 + "\n")
+
+print(f"\nResults saved to: {output/ 'backtest_results.txt'}")
+
+# Save CSV
 df.to_csv(output / 'test_factors.csv', index=False)
 pr.to_csv(output / 'test_prices.csv', index=False)
-
-print(f"\nSaved to {output}: test_factors.csv, test_prices.csv")
