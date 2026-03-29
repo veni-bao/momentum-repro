@@ -1,196 +1,430 @@
 # -*- coding: utf-8 -*-
 """
-01_数据清洗与预处理
+01_数据接口与预处理
 ===========================
-获取2010-2019年全A日频OHLCV、换手率、集合竞价数据
-样本过滤：剔除ST、停牌、上市不足60日次新股
-输出：cleaned_data.parquet
+统一数据加载接口，支持多种数据源
 """
 
 import pandas as pd
 import numpy as np
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Any
 from pathlib import Path
+import yaml
+import warnings
 
-# ============== 配置 ==============
-DATA_PATH = Path(__file__).parent / "data"
-OUTPUT_PATH = Path(__file__).parent / "output"
-START_DATE = "20100101"
-END_DATE = "20190731"
-MIN_TRADING_DAYS = 60  # 上市至少60个交易日
 
-# ============== 数据获取接口 ==============
-def get_data_from_tushare():
-    """
-    从Tushare获取数据
-    需要字段:
-    - daily: ts_code, trade_date, open, high, low, close, vol, amount
-    - daily_basic: ts_code, trade_date, turnover_rate, turnover_rate_f, volume_ratio
-    - stock_basic: ts_code, list_date, delist_date, is_hs, is_st
-    """
-    import tushare as ts
+# ========== 1. 统一数据格式 ==========
+
+@dataclass
+class UnifiedDataSchema:
+    """统一数据格式定义"""
+    # 必填字段
+    ts_code: str = ""          # 股票代码
+    trade_date: str = ""       # 交易日期 YYYYMMDD
+    open: float = 0.0          # 开盘价
+    high: float = 0.0          # 最高价
+    low: float = 0.0            # 最低价
+    close: float = 0.0         # 收盘价
+    volume: float = 0.0         # 成交量
     
-    # 设置token (需要用户自己设置)
-    # pro = ts.pro_api('YOUR_TOKEN')
+    # 选填字段 (可估算)
+    turnover_rate: Optional[float] = None     # 换手率
+    turnover_rate_f: Optional[float] = None   # 流通换手率
+    float_share: Optional[float] = None      # 流通股本
+    amount: Optional[float] = None         # 成交额
+    is_st: bool = False                    # 是否ST
+    list_date: Optional[str] = None         # 上市日期
+    prev_close: Optional[float] = None      # 昨日收盘价
     
-    print("请安装tushare并设置token:")
-    print("pip install tushare")
-    print("或使用AKShare作为替代")
-    raise NotImplementedError("请先配置数据源")
+    @classmethod
+    def get_required_columns(cls) -> List[str]:
+        return ['ts_code', 'trade_date', 'open', 'high', 'low', 'close', 'volume']
+    
+    @classmethod
+    def get_optional_columns(cls) -> List[str]:
+        return ['turnover_rate', 'turnover_rate_f', 'float_share', 
+                'amount', 'is_st', 'list_date', 'prev_close']
 
 
-def get_data_from_akshare():
+# ========== 2. 字段映射器 ==========
+
+class FieldMapper:
     """
-    从AKShare获取数据（免费开源）
+    字段映射器
+    处理不同数据源的字段名差异
     """
-    import akshare as ak
     
-    print("使用AKShare获取数据...")
+    # 默认字段映射 (标准名 -> 常见别名)
+    DEFAULT_MAPPING = {
+        'ts_code': ['ts_code', 'stock_code', 'code', 'symbol', '股票代码', '代码'],
+        'trade_date': ['trade_date', 'date', '日期', 'datetime', '交易日期'],
+        'open': ['open', 'open_price', '开盘价', 'openprice'],
+        'high': ['high', 'high_price', '最高价', 'highprice'],
+        'low': ['low', 'low_price', '最低价', 'lowprice'],
+        'close': ['close', 'close_price', '收盘价', 'closeprice'],
+        'volume': ['volume', 'vol', '成交量', 'amount'],  # 注意: amount 实际是成交额
+        'turnover_rate': ['turnover_rate', 'turnover', '换手率', 'turn'],
+        'turnover_rate_f': ['turnover_rate_f', 'turnover_f', '流通换手率'],
+    }
     
-    # 获取股票日线数据
-    # stock_zh_a_hist(symbol="000001", period="daily", start_date="20100101", end_date="20190731")
+    def __init__(self, custom_mapping: Optional[Dict[str, List[str]]] = None):
+        """
+        Args:
+            custom_mapping: 自定义映射, 格式 {"标准名": ["别名1", "别名2"]}
+        """
+        self.mapping = self.DEFAULT_MAPPING.copy()
+        if custom_mapping:
+            self.mapping.update(custom_mapping)
     
-    print("AKShare数据获取功能待实现")
-    raise NotImplementedError("请先确认数据源")
+    def detect_and_map(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        自动检测并映射字段
+        
+        Returns:
+            映射后的DataFrame
+        """
+        result = pd.DataFrame()
+        unmapped = []
+        
+        # 创建反向映射 (别名 -> 标准名)
+        alias_to_std = {}
+        for std, aliases in self.mapping.items():
+            for alias in aliases:
+                alias_to_std[alias.lower()] = std
+        
+        # 匹配列名
+        for col in df.columns:
+            col_lower = col.lower().strip()
+            if col_lower in alias_to_std:
+                std_name = alias_to_std[col_lower]
+                result[std_name] = df[col]
+            else:
+                # 尝试精确匹配
+                if col in self.mapping:
+                    result[col] = df[col]
+                else:
+                    unmapped.append(col)
+        
+        if unmapped:
+            warnings.warn(f"未映射的列: {unmapped[:5]}")
+        
+        return result
+    
+    def estimate_missing(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        估算缺失字段
+        """
+        result = df.copy()
+        
+        # 1. 估算 prev_close (昨日收盘价)
+        if 'prev_close' not in result.columns and 'close' in result.columns:
+            result = result.sort_values(['ts_code', 'trade_date'])
+            result['prev_close'] = result.groupby('ts_code')['close'].shift(1)
+        
+        # 2. 估算 turnover_rate (换手率)
+        if 'turnover_rate' not in result.columns:
+            if 'amount' in result.columns and 'float_share' in result.columns:
+                result['turnover_rate'] = result['amount'] / result['float_share'] * 100
+            elif 'volume' in result.columns and 'float_share' in result.columns:
+                result['turnover_rate'] = result['volume'] / result['float_share'] * 100
+        
+        # 3. 估算 float_share (流通股本)
+        if 'float_share' not in result.columns:
+            if 'amount' in result.columns and 'close' in result.columns:
+                # 市值 / 价格 = 股本
+                result['float_share'] = result['amount'] / result['close']
+        
+        return result
 
 
-def load_local_data():
+# ========== 3. 数据校验器 ==========
+
+@dataclass
+class ValidationReport:
+    """校验报告"""
+    is_valid: bool = True
+    errors: List[str] = field(default_factory=list)
+    warnings: List[str] = field(default_factory=list)
+    stats: Dict[str, Any] = field(default_factory=dict)
+
+
+class DataValidator:
     """
-    加载本地parquet数据
+    数据校验器
+    L0: 必填字段
+    L1: 数据类型
+    L2: 数值范围
+    L3: 业务逻辑
     """
-    data_file = DATA_PATH / "raw_data.parquet"
-    if data_file.exists():
-        return pd.read_parquet(data_file)
+    
+    def __init__(self, strict: bool = False):
+        self.strict = strict
+    
+    def validate(self, df: pd.DataFrame) -> ValidationReport:
+        """执行校验"""
+        report = ValidationReport()
+        
+        # L0: 必填字段检查
+        required = UnifiedDataSchema.get_required_columns()
+        missing = [c for c in required if c not in df.columns]
+        if missing:
+            report.errors.append(f"缺少必填字段: {missing}")
+            report.is_valid = False
+        
+        if not report.is_valid:
+            return report
+        
+        # L1: 数据类型检查
+        numeric_cols = ['open', 'high', 'low', 'close', 'volume']
+        for col in numeric_cols:
+            if col in df.columns:
+                if not pd.api.types.is_numeric_dtype(df[col]):
+                    report.warnings.append(f"{col} 不是数值类型")
+        
+        # L2: 数值范围检查
+        for col in ['open', 'close', 'high', 'low']:
+            if col in df.columns:
+                if (df[col] <= 0).any():
+                    n_invalid = (df[col] <= 0).sum()
+                    report.warnings.append(f"{col} 有 {n_invalid} 个非正值")
+        
+        if 'volume' in df.columns:
+            if (df['volume'] < 0).any():
+                report.errors.append("volume 不能为负")
+                report.is_valid = False
+        
+        # L3: 业务逻辑检查
+        if all(c in df.columns for c in ['high', 'low']):
+            if (df['high'] < df['low']).any():
+                n_invalid = (df['high'] < df['low']).sum()
+                report.warnings.append(f"high < low: {n_invalid} 条")
+        
+        if all(c in df.columns for c in ['high', 'open', 'close']):
+            if ((df['high'] < df['open']) | (df['high'] < df['close'])).any():
+                report.warnings.append("存在 high < open 或 high < close")
+        
+        # 统计信息
+        report.stats = {
+            'total_rows': len(df),
+            'total_stocks': df['ts_code'].nunique() if 'ts_code' in df.columns else 0,
+            'date_range': (df['trade_date'].min(), df['trade_date'].max()) if 'trade_date' in df.columns else None,
+        }
+        
+        return report
+
+
+# ========== 4. 数据适配器 ==========
+
+class DataAdapter(ABC):
+    """数据适配器基类"""
+    
+    @abstractmethod
+    def load_raw(self, **kwargs) -> pd.DataFrame:
+        """加载原始数据"""
+        pass
+
+
+class TushareAdapter(DataAdapter):
+    """Tushare适配器"""
+    
+    def __init__(self, token: str):
+        self.token = token
+    
+    def load_raw(self, start_date: str, end_date: str, **kwargs) -> pd.DataFrame:
+        try:
+            import tushare as ts
+            pro = ts.pro_api(self.token)
+            
+            # 获取所有A股
+            df = pro.daily(
+                start_date=start_date.replace('-', ''),
+                end_date=end_date.replace('-', '')
+            )
+            return df
+        except ImportError:
+            raise ImportError("请安装tushare: pip install tushare")
+        except Exception as e:
+            raise RuntimeError(f"Tushare加载失败: {e}")
+
+
+class AKShareAdapter(DataAdapter):
+    """AKShare适配器"""
+    
+    def load_raw(self, symbol: str = "000001", start_date: str = "20100101", 
+                 end_date: str = "20190731", **kwargs) -> pd.DataFrame:
+        try:
+            import akshare as ak
+            # 需要手动循环获取多只股票
+            # 这里简化返回空DataFrame
+            warnings.warn("AKShare需要逐个股票获取，请使用其他方式")
+            return pd.DataFrame()
+        except ImportError:
+            raise ImportError("请安装akshare: pip install akshare")
+
+
+class CSVAdapter(DataAdapter):
+    """CSV文件适配器"""
+    
+    def __init__(self, file_path: str):
+        self.file_path = Path(file_path)
+    
+    def load_raw(self, **kwargs) -> pd.DataFrame:
+        if not self.file_path.exists():
+            raise FileNotFoundError(f"文件不存在: {self.file_path}")
+        
+        # 自动检测分隔符
+        for sep in [',', '\t', ';', '|']:
+            try:
+                df = pd.read_csv(self.file_path, sep=sep, nrows=5)
+                if len(df.columns) > 1:
+                    return pd.read_csv(self.file_path, sep=sep)
+            except:
+                continue
+        
+        raise ValueError("无法解析CSV文件")
+
+
+class DataFrameAdapter(DataAdapter):
+    """DataFrame适配器 (内存数据)"""
+    
+    def __init__(self, df: pd.DataFrame):
+        self.df = df
+    
+    def load_raw(self, **kwargs) -> pd.DataFrame:
+        return self.df.copy()
+
+
+# ========== 5. 统一入口 ==========
+
+class DataLoader:
+    """
+    统一数据加载入口
+    """
+    
+    def __init__(
+        self, 
+        adapter: DataAdapter,
+        field_mapping: Optional[Dict[str, List[str]]] = None,
+        strict: bool = False
+    ):
+        """
+        Args:
+            adapter: 数据适配器
+            field_mapping: 自定义字段映射
+            strict: 是否严格模式
+        """
+        self.adapter = adapter
+        self.mapper = FieldMapper(field_mapping)
+        self.validator = DataValidator(strict)
+    
+    def load(self, **kwargs) -> pd.DataFrame:
+        """
+        加载并处理数据
+        
+        Returns:
+            统一格式的DataFrame
+        """
+        # 1. 加载原始数据
+        print("[1/4] 加载原始数据...")
+        raw_df = self.adapter.load_raw(**kwargs)
+        print(f"    原始数据: {len(raw_df):,} 行")
+        
+        # 2. 字段映射
+        print("[2/4] 字段映射...")
+        mapped_df = self.mapper.detect_and_map(raw_df)
+        
+        # 3. 估算缺失
+        print("[3/4] 估算缺失字段...")
+        estimated_df = self.mapper.estimate_missing(mapped_df)
+        
+        # 4. 校验
+        print("[4/4] 数据校验...")
+        report = self.validator.validate(estimated_df)
+        
+        if report.errors:
+            print(f"    错误: {report.errors[0]}")
+        if report.warnings:
+            print(f"    警告: {len(report.warnings)} 项")
+        
+        print(f"    有效数据: {len(estimated_df):,} 行")
+        
+        if report.stats:
+            print(f"    股票数: {report.stats.get('total_stocks', 'N/A')}")
+        
+        return estimated_df
+
+
+# ========== 6. 便捷函数 ==========
+
+def load_data(
+    source: str = "csv",
+    file_path: str = None,
+    token: str = None,
+    df: pd.DataFrame = None,
+    field_mapping: Dict[str, List[str]] = None,
+    **kwargs
+) -> pd.DataFrame:
+    """
+    便捷数据加载函数
+    
+    Examples:
+        # 从CSV加载
+        df = load_data("csv", "data/stocks.csv")
+        
+        # 从DataFrame加载
+        df = load_data("df", df=my_dataframe)
+        
+        # 从Tushare加载
+        df = load_data("tushare", token="xxx", start_date="20100101", end_date="20190731")
+    
+    Args:
+        source: 数据源类型 ("csv", "tushare", "akshare", "df")
+        file_path: CSV文件路径
+        token: Tushare token
+        df: 内存DataFrame
+        field_mapping: 自定义字段映射
+    
+    Returns:
+        统一格式的DataFrame
+    """
+    if source == "csv" and file_path:
+        adapter = CSVAdapter(file_path)
+    elif source == "tushare" and token:
+        adapter = TushareAdapter(token)
+    elif source == "df" and df is not None:
+        adapter = DataFrameAdapter(df)
     else:
-        raise FileNotFoundError(f"未找到数据文件: {data_file}")
+        raise ValueError(f"未知数据源: {source}")
+    
+    loader = DataLoader(adapter, field_mapping)
+    return loader.load(**kwargs)
 
 
-# ============== 数据预处理 ==============
-def calculate_returns(df):
-    """
-    计算日内收益和隔夜收益
-    
-    日内收益: r_t = close_t / open_t - 1
-    隔夜收益: g_t = open_t / close_{t-1} - 1
-    """
-    df = df.sort_values(['ts_code', 'trade_date'])
-    
-    # 日内收益
-    df['r_intraday'] = df['close'] / df['open'] - 1
-    
-    # 隔夜收益 (需要前一日收盘价)
-    df['prev_close'] = df.groupby('ts_code')['close'].shift(1)
-    df['r_overnight'] = df['open'] / df['prev_close'] - 1
-    
-    return df
+# ========== 7. 主函数 ==========
 
-
-def calculate_turnover(df):
-    """
-    计算换手率相关指标
-    
-    日内换手率 = (总成交量 - 集合竞价成交量) / 流通股本
-    隔夜换手率 = 集合竞价成交量 / 流通股本
-    昨日换手率 = shift(总换手率, 1)
-    """
-    # 如果没有集合竞价数据，用总成交量*0.1估算
-    if 'auction_volume' not in df.columns:
-        print("警告: 无集合竞价数据，使用估算值")
-        df['auction_volume'] = df['volume'] * 0.1
-    
-    # 流通股本 (元/净)
-    if 'float_share' not in df.columns:
-        # 用 amount/close 估算
-        df['float_share'] = df['amount'] / df['close']
-    
-    # 日内换手率
-    df['TR_intraday'] = (df['volume'] - df['auction_volume']) / df['float_share']
-    
-    # 隔夜换手率
-    df['TR_overnight'] = df['auction_volume'] / df['float_share']
-    
-    # 昨日换手率
-    df['TR_yesterday'] = df.groupby('ts_code')['turnover_rate'].shift(1)
-    
-    return df
-
-
-def filter_valid_stocks(df):
-    """
-    过滤有效股票池
-    - 剔除ST股
-    - 剔除停牌日 (vol=0 或 close=open=prev_close)
-    - 剔除上市不足60日的次新股
-    """
-    # 剔除ST
-    df = df[~df['is_st'].fillna(False)]
-    
-    # 剔除停牌日 (成交量为0)
-    df = df[df['volume'] > 0]
-    
-    # 剔除上市不足60日
-    # 需要根据list_date计算
-    
-    return df
-
-
-def process_nan(df):
-    """
-    处理NaN值
-    - 前向填充收益率
-    - 换手率NaN设为0
-    """
-    df['r_intraday'] = df['r_intraday'].fillna(0)
-    df['r_overnight'] = df['r_overnight'].fillna(0)
-    df['TR_intraday'] = df['TR_intraday'].fillna(0)
-    df['TR_overnight'] = df['TR_overnight'].fillna(0)
-    df['TR_yesterday'] = df['TR_yesterday'].fillna(0)
-    
-    return df
-
-
-# ============== 主函数 ==============
 def main():
+    """测试入口"""
     print("=" * 50)
-    print("Step 1: 数据获取与预处理")
+    print("数据接口测试")
     print("=" * 50)
     
-    # 1. 加载数据
-    print("\n[1/5] 加载原始数据...")
-    try:
-        df = load_local_data()
-    except FileNotFoundError as e:
-        print(e)
-        print("\n请先准备数据文件到 data/raw_data.parquet")
-        print("或修改代码使用Tushare/AKShare")
-        return None
+    # 测试: 创建示例数据
+    test_data = pd.DataFrame({
+        '股票代码': ['000001', '000001', '000002', '000002'],
+        '交易日期': ['20190101', '20190102', '20190101', '20190102'],
+        '开盘价': [10.0, 10.5, 20.0, 20.5],
+        '收盘价': [10.5, 10.2, 20.5, 21.0],
+        '最高价': [10.8, 10.8, 21.0, 21.2],
+        '最低价': [9.8, 10.0, 19.5, 20.0],
+        '成交量': [1000000, 1200000, 800000, 900000],
+    })
     
-    print(f"原始数据量: {len(df):,} 行")
-    
-    # 2. 计算收益
-    print("\n[2/5] 计算日内/隔夜收益...")
-    df = calculate_returns(df)
-    
-    # 3. 计算换手率
-    print("\n[3/5] 计算换手率指标...")
-    df = calculate_turnover(df)
-    
-    # 4. 过滤有效股票
-    print("\n[4/5] 过滤有效股票池...")
-    df = filter_valid_stocks(df)
-    
-    # 5. 处理NaN
-    print("\n[5/5] 处理缺失值...")
-    df = process_nan(df)
-    
-    # 保存
-    output_file = DATA_PATH / "cleaned_data.parquet"
-    df.to_parquet(output_file, index=False)
-    print(f"\n保存到: {output_file}")
-    print(f"最终数据量: {len(df):,} 行")
-    print(f"股票数量: {df['ts_code'].nunique()}")
-    print(f"时间范围: {df['trade_date'].min()} ~ {df['trade_date'].max()}")
-    
-    return df
+    # 加载
+    df = load_data("df", df=test_data)
+    print("\n加载完成!")
+    print(df.head())
 
 
 if __name__ == "__main__":
