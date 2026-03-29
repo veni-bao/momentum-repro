@@ -1,14 +1,14 @@
-# Test script
+# Mock data generator
 import pandas as pd
 import numpy as np
 from scipy import stats
 
 np.random.seed(42)
 print("=" * 50)
-print("Pipeline Test")
+print("Mock Data Generator")
 print("=" * 50)
 
-# 1. Mock data
+# 1. 创建模拟数据
 dates = [f'2019{str(m).zfill(2)}{str(d).zfill(2)}' for m in range(1,13) for d in range(1,29)][:50]
 stocks = [f'{i:06d}' for i in range(1,51)]
 
@@ -23,13 +23,13 @@ for code in stocks:
 df = pd.DataFrame(data).sort_values(['ts_code','trade_date'])
 df['ret'] = df['close'] / df['prev_close'] - 1
 
-# 2. OLD_Momentum
+# 2. 计算OLD_Momentum
 lb = 20
 df['OLD_Momentum'] = df.groupby('ts_code')['ret'].transform(
     lambda g: g.rolling(lb).apply(lambda x: np.prod(1+x)-1, raw=False)
 )
 
-# 3. NEW factors
+# 3. 构造NEW因子
 df['NEW_Intra'] = np.random.randn(len(df)) * 0.1 + df['OLD_Momentum'] * 0.5
 df['NEW_Over'] = np.random.randn(len(df)) * 0.1 - df['OLD_Momentum'] * 0.3
 df['NEW_Momentum'] = df['NEW_Intra'] + df['NEW_Over']
@@ -50,26 +50,29 @@ for fc in ['OLD_Momentum', 'NEW_Intra', 'NEW_Over', 'NEW_Momentum']:
     
     ic, _ = stats.spearmanr(v[fc], v['fwd'])
     
-    # Use rank instead of qcut
-    try:
-        v['rank'] = v[fc].rank(pct=True)
-        v['g'] = pd.cut(v['rank'], bins=[0,0.2,0.4,0.6,0.8,1], labels=[1,2,3,4,5])
-        g1 = v[v['g']==1]['fwd'].mean()
-        g5 = v[v['g']==5]['fwd'].mean()
-        ls = g1 - g5
-        ann = ls * 12 * 100
-        vol = v['fwd'].std() * 312
-        ir = ann / vol if vol > 0 else 0
-    except Exception as e:
-        ann, ir = 0, 0
+    v['rank'] = v[fc].rank(pct=True)
+    v['g'] = pd.cut(v['rank'], bins=[0,0.2,0.4,0.6,0.8,1], labels=[1,2,3,4,5])
+    g1 = v[v['g']==1]['fwd'].mean()
+    g5 = v[v['g']==5]['fwd'].mean()
+    ls = g1 - g5
+    ann = ls * 12 * 100
+    vol = v['fwd'].std() * 312
+    ir = ann / vol if vol > 0 else 0
     
     print(f"{fc:<15} IC:{ic:+.3f}  Ann:{ann:+.1f}%  IR:{ir:+.2f}")
 
 print("-"*50)
 print("SUCCESS!")
 
-# Save
+# 保存
+import sys
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from pathlib import Path
-Path('output').mkdir(exist_ok=True)
-df.to_csv('output/test_factors.csv', index=False)
-print("Saved to output/test_factors.csv")
+
+output = Path(__file__).parent.parent / 'output'
+output.mkdir(exist_ok=True)
+
+df.to_csv(output / 'test_factors.csv', index=False)
+pr.to_csv(output / 'test_prices.csv', index=False)
+
+print(f"\nSaved to {output}: test_factors.csv, test_prices.csv")
